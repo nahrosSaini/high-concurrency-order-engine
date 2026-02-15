@@ -2,11 +2,11 @@ package com.dev.flash_sale_engine.services;
 
 import java.time.LocalDateTime;
 
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.dev.flash_sale_engine.models.Order;
-import com.dev.flash_sale_engine.models.Product;
 import com.dev.flash_sale_engine.repositories.OrderRepository;
 import com.dev.flash_sale_engine.repositories.ProductRepository;
 
@@ -18,31 +18,37 @@ public class OrderService {
 
     private final ProductRepository productRepository;
 
-    public OrderService(OrderRepository orderRepository, ProductRepository productRepository){
+    private final StringRedisTemplate redisTemplate;
+
+    public OrderService(OrderRepository orderRepository, ProductRepository productRepository,StringRedisTemplate redisTemplate){
         this.orderRepository=orderRepository;
         this.productRepository=productRepository;
+        this.redisTemplate=redisTemplate;
     }
 
     @Transactional
     public Order placeOrder(Long productId,Integer quantity){
 
-        // 1. Find Product using standard findById (No Lock)
-        //Product product= productRepository.findById(productId).get(); 
-        Product product= productRepository.findByIdWithLock(productId).get();
+        
+        //Product product= productRepository.findById(productId).get();  // Retry Strom
+        //Product product= productRepository.findByIdWithLock(productId).get(); // High response time
 
-        // 2. If product is null then throw the error
-        if(product==null){
-            throw new RuntimeException("Product not found !!");
+        // 1. Check stock in Redis. (Atomic Operation)
+        Long remainingStock=redisTemplate.opsForValue().decrement("product:"+productId+":stock",quantity);
+
+        // 2. Validate the stock
+        if(remainingStock!=null && remainingStock < 0){
+            redisTemplate.opsForValue().increment("product:"+productId+":stock",quantity);
+            throw new RuntimeException("Sold out in Redis..!!");
         }
 
-        // 3. Check the stock
-        if(product.getStock() < quantity){
-            throw new RuntimeException("Insufficient stock for product : "+productId);
-        }
+        // 3. MYSQL Atomic Update (The Fix)
+        int rowsUpdated=productRepository.decreaseStock(productId,quantity);
 
-        // 4. Decrement the stock
-        product.setStock(product.getStock()-quantity);
-        productRepository.save(product);
+        // 4. Lets handle rare case when stock in DB and Redis is not in sync.
+        if(rowsUpdated == 0){
+            throw new RuntimeException("Database Stock Sync Error..!!");
+        }
 
         // 5. Create Order
         Order order=new Order();
@@ -146,5 +152,65 @@ Consider we have 1000 request trying to access this row then when first request 
 now if we compare the response time of the first and the last request then we will observe a delay of few milliseconds.
 
 We need to resolve this performance issue.
+
+*/
+
+/*
+
+STEP - 4 :
+
+Now to resolve our response time issue we need to make some Architecture changes.
+
+Issue : When we recevie 1000 requests each request execute a DB query to fetch the stock quantity. This added some overhead on the DB and delays the request by few milliseconds.
+
+How to solve this : 
+
+1. "REDIS CACHE" :  Redis cache is one part of our solution here. 
+
+Why REDIS : 
+
+In-Memory:  It doesn't touch the slow hard drive.
+Atomic Operations: Redis has a command called DECRBY. If 1,000 threads hit it at once, Redis handles them internally one by one at lightning speed (sub-millisecond).
+Lua Scripting: You can send a small script to Redis that says: "Check if stock > 0. If yes, subtract 1. If no, return error." 
+               This whole logic happens inside Redis in one atomic step.
+
+Now we put our stock quantity in redis and let each request read stock of the product from redis instead of DB.
+
+
+Let SetUp :
+
+1. Instead of running Redis on my machine. We we do it via docker. Lets install docker and create a container with redis Image.
+
+Docker download link : https://www.docker.com/products/docker-desktop/
+
+If manually you want to dowload the redis image.
+Download redis Image : docker run --name flash-sale-redis -p 6379:6379 -d redis
+
+Im doing it via docker-compose.yml file.
+
+few commands : 
+
+    docker-compose up -d: Starts all services (Redis) in the background.
+
+    docker-compose down: Stops and removes all services at once, cleaning up your workspace.
+
+    docker-compose ps: Shows you a neat table of all your containers.
+
+
+Once Docker and redis is installed.
+
+Set the stock in redis via RedisInsight( You need to download this if you like UI) or commandLine.
+
+-> Get Stock : docker exec -it flash-sale-redis redis-cli GET product:1:stock
+-> Set Stock : docker exec -it flash-sale-redis redis-cli SET product:1:stock 10
+
+----
+
+Now only 10 request are going inside the DB of 100 request. we have avoid other 90 requests from go to DB for reading the Stock.
+
+Now we have more impromement to do that is today we have 100  requests and once stock is good we create the order. 
+Until we create the order we keep the thread active.
+
+Why not separate this logic via a queue like Kafka.
 
 */
