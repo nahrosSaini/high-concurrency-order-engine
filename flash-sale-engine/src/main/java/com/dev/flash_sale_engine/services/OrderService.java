@@ -1,37 +1,26 @@
 package com.dev.flash_sale_engine.services;
 
-import java.time.LocalDateTime;
-
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
-import com.dev.flash_sale_engine.models.Order;
-import com.dev.flash_sale_engine.repositories.OrderRepository;
-import com.dev.flash_sale_engine.repositories.ProductRepository;
+import lombok.extern.slf4j.Slf4j;
 
+@Slf4j
 @Service
 public class OrderService {    
    
     //By using final, you guarantee the dependency isn't null and can't be changed accidentally at runtime.
-    private final OrderRepository orderRepository;
-
-    private final ProductRepository productRepository;
-
     private final StringRedisTemplate redisTemplate;
 
-    public OrderService(OrderRepository orderRepository, ProductRepository productRepository,StringRedisTemplate redisTemplate){
-        this.orderRepository=orderRepository;
-        this.productRepository=productRepository;
+    private final KafkaTemplate<String,String> kafkaTemplate;
+
+    public OrderService(StringRedisTemplate redisTemplate,KafkaTemplate<String,String> kafkaTemplate){     
         this.redisTemplate=redisTemplate;
+        this.kafkaTemplate=kafkaTemplate;
     }
 
-    @Transactional
-    public Order placeOrder(Long productId,Integer quantity){
-
-        
-        //Product product= productRepository.findById(productId).get();  // Retry Strom
-        //Product product= productRepository.findByIdWithLock(productId).get(); // High response time
+    public Boolean placeOrder(Long productId,Integer quantity){
 
         // 1. Check stock in Redis. (Atomic Operation)
         Long remainingStock=redisTemplate.opsForValue().decrement("product:"+productId+":stock",quantity);
@@ -39,25 +28,13 @@ public class OrderService {
         // 2. Validate the stock
         if(remainingStock!=null && remainingStock < 0){
             redisTemplate.opsForValue().increment("product:"+productId+":stock",quantity);
-            throw new RuntimeException("Sold out in Redis..!!");
+            return false;
         }
 
-        // 3. MYSQL Atomic Update (The Fix)
-        int rowsUpdated=productRepository.decreaseStock(productId,quantity);
+        // 3. Push the details to kafka
+        kafkaTemplate.send("flash_sale_orders",productId+":"+quantity);
 
-        // 4. Lets handle rare case when stock in DB and Redis is not in sync.
-        if(rowsUpdated == 0){
-            throw new RuntimeException("Database Stock Sync Error..!!");
-        }
-
-        // 5. Create Order
-        Order order=new Order();
-        order.setProductId(productId);
-        order.setQuantity(quantity);
-        order.setOrderTime(LocalDateTime.now());
-
-        // 6. save and return Order
-        return orderRepository.save(order);
+        return true;
 
     }
 }
@@ -212,5 +189,28 @@ Now we have more impromement to do that is today we have 100  requests and once 
 Until we create the order we keep the thread active.
 
 Why not separate this logic via a queue like Kafka.
+
+*/
+
+
+/*
+
+STEP - 5
+
+Now we have implemented Basic Apache Kafka with Topic and one Partition. 
+
+1. The moment we recevied request we check in redis stock and decrement it.
+2. Then we validate new value if its not correct then we increment the stock in redis.
+3. If stock looks good then we add the productId and quantity in Kafka topic.
+
+4. Now one Consumer is listening to this topic.
+5. Its will pick the data from the queue topic.
+6. Using the product id we will update the stock in DB for the product.
+7. Now we can save the order in DB.
+
+Validated and looks correct. I can see good response time. 
+
+Now lets scale and play around.
+
 
 */
